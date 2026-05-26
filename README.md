@@ -212,3 +212,7 @@ git submodule update --init
 make
 make test
 ```
+
+## Mirroring
+
+This repo is mirrored read-only to [github.com/califio/ngxray](https://github.com/califio/ngxray) via Copybara. See [COPYBARA.md](COPYBARA.md).
