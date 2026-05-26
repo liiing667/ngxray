@@ -1,0 +1,7 @@
+build/
+*.o
+__pycache__/
+*.pyc
+results/
+rules/UNRELEASED*.json
+test-docker
