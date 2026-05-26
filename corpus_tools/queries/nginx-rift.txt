@@ -1,0 +1,41 @@
+"rewrite " "set " "$1" extension:conf
+"rewrite " "set " "$2" extension:conf
+"rewrite " "set " "$3" extension:conf
+"rewrite " "set " "$1" language:Nginx
+"rewrite " "set " "$2" language:Nginx
+"rewrite " "set " "$1" filename:nginx.conf
+"rewrite " "set " "$1" filename:default.conf
+"rewrite " "set " "$1" nginx extension:j2
+"rewrite " "set " "$1" nginx extension:template
+"rewrite " "set " "$1" nginx extension:erb
+"rewrite " "set " "$1" nginx extension:tmpl
+"rewrite " "set " "$1" nginx extension:yaml
+"rewrite " "set " "$1" nginx extension:yml
+"rewrite " "set " "$1" filename:Dockerfile
+"rewrite " "set " "$1" extension:sh
+"rewrite " "set " "$1" extension:md
+"rewrite " "set " "$1" "server {"
+"rewrite " "set " "$2" "server {"
+"rewrite " "set " "$1" "location ~"
+"rewrite " "set " "$2" "location ~"
+"rewrite " "set $" "$1" "/etc/nginx"
+"rewrite " "set $" "$1" path:nginx
+"rewrite " "set $" "$1" path:conf.d
+"rewrite " "set $" "$1" path:sites-available
+"rewrite " "set $" "$1" path:deploy
+"rewrite " "set $" "$1" path:templates
+"rewrite " "set $" "$1" path:roles
+"rewrite " "set $" "$1" path:docker
+"rewrite " "set $" "$1" "?"
+"rewrite " "set $" "$2" "?"
+"rewrite " "set $" "$3" "?"
+"rewrite " "set $" "$1;" "?"
+"rewrite " "set $" "$2;" "?"
+"rewrite " "set $" "$3;" "?"
+"rewrite " "set $original" "$1"
+"rewrite " "set $uri" "$1"
+"rewrite " "set $request_uri" "$1"
+"rewrite " "set $args" "$1"
+"rewrite " "set $path" "$1"
+"rewrite " "set $backend" "$1"
+"rewrite " "set $upstream" "$1"

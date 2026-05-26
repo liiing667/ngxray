@@ -79,6 +79,21 @@ def walk_rewrite_scope(nodes, name):
             yield from walk_rewrite_scope(children(n), name)
 
 
+def walk_rewrite_scope_all(nodes):
+    """Walk every node in source order within one rewrite-phase scope."""
+    for n in nodes:
+        yield n
+        if n["directive"] not in PHASE_BOUNDARY_DIRECTIVES:
+            yield from walk_rewrite_scope_all(children(n))
+
+
+def walk_all(nodes):
+    """Walk every node in source order, including structural sub-blocks."""
+    for n in nodes:
+        yield n
+        yield from walk_all(children(n))
+
+
 def all_blocks(nodes):
     """Yield (block_contents, parent_node) for every block in the tree."""
     for n in nodes:
@@ -381,16 +396,19 @@ def collect_phase(nodes, collect_spec):
 
 
 def _get_candidates(block, pat):
-    """Get candidate nodes for a pattern within a block."""
+    """Get (source_order, node) candidates for a pattern within a block."""
     scope = pat.get("scope", "siblings")
     dname = pat.get("directive_any_of", pat.get("directive"))
 
     if scope == "subtree":
-        return list(walk_rewrite_scope(block, dname))
+        nodes = walk_rewrite_scope_all(block)
     elif scope == "full_subtree":
-        return list(walk(block, dname))
+        nodes = walk_all(block)
     else:
-        return list(block)
+        nodes = iter(block)
+
+    return [(i, n) for i, n in enumerate(nodes)
+            if _match_name(n["directive"], dname)]
 
 
 def eval_rule(rule, nodes, filepath):
@@ -415,17 +433,16 @@ def eval_rule(rule, nodes, filepath):
         ordered = rule.get("ordered", False)
         for block, parent in all_blocks(nodes):
             matched = []
-            last_idx = -1
+            last_pos = -1
             for pat in patterns:
                 hit = None
                 candidates = _get_candidates(block, pat)
-                for node in candidates:
+                for node_pos, node in candidates:
                     if match_directive(node, pat, collected):
-                        if ordered and pat.get("scope", "siblings") == "siblings":
-                            node_idx = block.index(node)
-                            if node_idx <= last_idx:
+                        if ordered:
+                            if node_pos <= last_pos:
                                 continue
-                            last_idx = node_idx
+                            last_pos = node_pos
                         hit = node
                         break
                 if hit is None:

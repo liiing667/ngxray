@@ -65,6 +65,26 @@ python3 scan.py --json /etc/nginx/nginx.conf
 python3 scan.py --rules ./my-rules/ /etc/nginx/nginx.conf
 ```
 
+## Corpus Collection
+
+The `corpus_tools/` package can collect public nginx configuration material
+from GitHub Code Search and extract nginx snippets from wrapper formats.
+
+```bash
+python3 corpus_tools/collect_github_nginx_corpus.py \
+  --output-dir corpus_out/nginx-rift \
+  --query-file corpus_tools/queries/nginx-rift.txt
+
+python3 corpus_tools/extract_nginx_configs.py \
+  --input-dir corpus_out/nginx-rift/raw \
+  --output-dir corpus_out/nginx-rift/extracted
+
+python3 scan.py corpus_out/nginx-rift/extracted
+```
+
+See `corpus_tools/README.md` and `corpus_tools/docs/` for the full workflow and
+the documented Rift-focused collection method.
+
 ## Adding new rules
 
 Drop a JSON file in `rules/`. The engine loads all `*.json` files from the rules directory at startup.
