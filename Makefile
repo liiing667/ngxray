@@ -3,6 +3,12 @@ CC      ?= cc
 CFLAGS  ?= -O2
 CFLAGS  += -Wall -Wno-unused-function -Wno-deprecated-declarations
 
+ifneq ($(MAKECMDGOALS),clean)
+ifeq ($(wildcard $(NGX_SRC)/core/ngx_palloc.c),)
+$(error nginx submodule not checked out. Run: git submodule update --init)
+endif
+endif
+
 INCLUDES = -Iparser \
            -I$(NGX_SRC)/core \
            -I$(NGX_SRC)/os/unix \

@@ -6,6 +6,7 @@ Static vulnerability scanner for nginx configurations. Parses configs with nginx
 
 ```bash
 cd ngxray
+git submodule update --init
 make
 python3 scan.py /etc/nginx/nginx.conf
 ```
