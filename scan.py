@@ -18,7 +18,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -43,6 +43,8 @@ class Finding:
     message: str
     cve: str = ""
     details: str = ""
+    conditions: list[str] = field(default_factory=list)
+    manual_review: str = ""
 
 
 # ── AST helpers ─────────────────────────────────────────────────────────
@@ -199,6 +201,13 @@ def rewrites_can_chain(node_a, node_b):
     # redirect — nginx returns 3xx and stops processing.  No chaining.
     if re.match(r'(?:https?://|\$scheme)', replacement):
         return False
+
+    out_uri = replacement.split('?')[0]
+    if out_uri and not re.search(r'\$[0-9a-zA-Z_]', out_uri):
+        try:
+            return re.search(args_b[0], out_uri) is not None
+        except re.error:
+            pass
 
     out_prefix = rewrite_output_prefix(replacement).lstrip('/')
     rx_prefix = regex_literal_prefix(args_b[0])
@@ -476,6 +485,8 @@ def make_finding(rule, primary, matched, filepath):
         message=rule["message"],
         cve=rule.get("cve", ""),
         details="\n".join(detail_parts),
+        conditions=list(rule.get("conditions", [])),
+        manual_review=rule.get("manual_review", ""),
     )
 
 
@@ -657,6 +668,12 @@ def main():
                 if f.details:
                     for dl in f.details.split("\n"):
                         print(f"    {dl}")
+                if f.conditions:
+                    print("    conditions required:")
+                    for cond in f.conditions:
+                        print(f"      - {cond}")
+                if f.manual_review:
+                    print(f"    manual review: {f.manual_review}")
                 print()
 
         print(f"{len(all_findings)} finding(s) in "
