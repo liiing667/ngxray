@@ -506,7 +506,8 @@ def load_rules(rules_dir=RULES_DIR):
 def parse_file(filepath):
     try:
         r = subprocess.run([PARSER, filepath],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, errors="replace",
+                           timeout=10)
         if r.returncode != 0:
             return None
         return json.loads(r.stdout)
