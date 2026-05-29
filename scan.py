@@ -108,59 +108,39 @@ def all_blocks(nodes):
 
 # ── Regex structure analysis ───────────────────────────────────────────
 
-def parse_capture_groups(regex):
+PCRE_GROUPS = str(BASE / "build" / "pcre_groups")
+
+
+def _get_group_ancestors(regex):
+    """Get the capture group nesting map using PCRE2 via the pcre_groups helper.
+
+    Returns a dict mapping each capturing group number to the set of all
+    ancestor group numbers that contain it.
     """
-    Parse a PCRE regex and return a dict mapping capturing group number to
-    its (open_pos, close_pos) in the regex string. Correctly skips escaped
-    parens, character classes, and non-capturing groups (?:, (?=, etc.).
-    """
-    groups = {}
-    stack = []
-    group_num = 0
-    i = 0
-    n = len(regex)
+    try:
+        r = subprocess.run([PCRE_GROUPS, regex],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return {}
+        rec = json.loads(r.stdout.strip())
+        if "error" in rec:
+            return {}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError,
+            FileNotFoundError):
+        return {}
 
-    while i < n:
-        c = regex[i]
+    parent_map = rec.get("parent", {})
+    ancestors = {}
+    for gid_str, pid in parent_map.items():
+        gid = int(gid_str)
+        anc = set()
+        cur = pid
+        while cur != 0:
+            anc.add(cur)
+            cur = parent_map.get(str(cur), 0)
+        ancestors[gid] = anc
 
-        if c == '\\':
-            i += 2
-            continue
-
-        if c == '[':
-            i += 1
-            if i < n and regex[i] == '^':
-                i += 1
-            if i < n and regex[i] == ']':
-                i += 1
-            while i < n and regex[i] != ']':
-                if regex[i] == '\\':
-                    i += 1
-                i += 1
-            i += 1
-            continue
-
-        if c == '(':
-            i += 1
-            if i < n and regex[i] == '?':
-                stack.append((None, i - 1))
-                i += 1
-            else:
-                group_num += 1
-                stack.append((group_num, i - 1))
-            continue
-
-        if c == ')':
-            if stack:
-                gn, start = stack.pop()
-                if gn is not None:
-                    groups[gn] = (start, i)
-            i += 1
-            continue
-
-        i += 1
-
-    return groups
+    return ancestors
 
 
 def rewrite_output_prefix(replacement):
@@ -225,20 +205,19 @@ def has_overlapping_refs(regex, replacement):
     captures. Returns True if any two $N references in the replacement
     correspond to capture groups where one physically contains the other.
     """
-    groups = parse_capture_groups(regex)
     refs = set(int(m.group(1)) for m in re.finditer(r'\$([1-9])', replacement))
     if len(refs) < 2:
         return False
 
-    ref_list = sorted(refs)
-    for i in range(len(ref_list)):
-        for j in range(i + 1, len(ref_list)):
-            a, b = ref_list[i], ref_list[j]
-            if a not in groups or b not in groups:
+    ancestors = _get_group_ancestors(regex)
+
+    for a in refs:
+        for b in refs:
+            if a >= b:
                 continue
-            a_s, a_e = groups[a]
-            b_s, b_e = groups[b]
-            if (a_s <= b_s and a_e >= b_e) or (b_s <= a_s and b_e >= a_e):
+            if a not in ancestors or b not in ancestors:
+                continue
+            if a in ancestors[b] or b in ancestors[a]:
                 return True
     return False
 

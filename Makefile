@@ -38,8 +38,12 @@ LOCAL_OBJS = $(BUILDDIR)/ngx_conf_file.o \
              $(BUILDDIR)/main.o
 
 TARGET = $(BUILDDIR)/nginx_conf_parse
+PCRE_GROUPS = $(BUILDDIR)/pcre_groups
 
-all: $(TARGET)
+PCRE2_CFLAGS := $(shell pkg-config --cflags libpcre2-8 2>/dev/null)
+PCRE2_LIBS   := $(shell pkg-config --libs libpcre2-8 2>/dev/null)
+
+all: $(TARGET) $(PCRE_GROUPS)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
@@ -70,7 +74,10 @@ $(BUILDDIR)/stubs.o: parser/stubs.c | $(BUILDDIR)
 $(BUILDDIR)/main.o: parser/main.c parser/conf_parse.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
-test: $(TARGET)
+$(PCRE_GROUPS): parser/pcre_groups.c | $(BUILDDIR)
+	$(CC) $(CFLAGS) $(PCRE2_CFLAGS) -o $@ $< $(PCRE2_LIBS)
+
+test: $(TARGET) $(PCRE_GROUPS)
 	@printf 'worker_processes auto;\nevents { worker_connections 1024; }\nhttp { server { listen 80; location / { root /var/www; } } }\n' > /tmp/_nrs_test.conf
 	@$(TARGET) /tmp/_nrs_test.conf | python3 -m json.tool > /dev/null && echo "parser: OK"
 	@rm -f /tmp/_nrs_test.conf
