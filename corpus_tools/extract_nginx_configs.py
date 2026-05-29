@@ -40,6 +40,8 @@ def classify(content, filename):
         return "k8s_yaml"
     if "{{" in content or "{%" in content:
         return "jinja"
+    if re.search(r"%\{\s*(if|for|else|endif|endfor)\b", content):
+        return "pct_template"
     if "<%" in content:
         return "erb"
     if s.startswith("#!"):
@@ -90,6 +92,16 @@ def strip_jinja(content):
         name = re.sub(r"[^a-zA-Z0-9_]", "", name) or "VAR"
         return f"__{name}__"
     content = re.sub(r"\{\{\s*(.*?)\s*\}\}", replace_expr, content, flags=re.DOTALL)
+    return content
+
+
+def strip_pct_template(content):
+    """Replace %{ if/for/else/endif/endfor }% constructs with comments."""
+    content = re.sub(
+        r"%\{\s*(if|for|else|endif|endfor|unless|end)\b[^}]*\}%",
+        lambda m: f"# pct: {m.group(1)}",
+        content,
+    )
     return content
 
 
@@ -244,6 +256,30 @@ def extract_from_markdown(content):
     return configs
 
 
+def strip_lua_blocks(content):
+    """Replace _by_lua_block { ... } with _by_lua_block {}, handling nested braces."""
+    result = []
+    i = 0
+    pattern = re.compile(r'(_by_lua(?:_block)?)\s*\{')
+    while i < len(content):
+        m = pattern.search(content, i)
+        if not m:
+            result.append(content[i:])
+            break
+        result.append(content[i:m.start()])
+        result.append(m.group(1) + " {}")
+        depth = 1
+        j = m.end()
+        while j < len(content) and depth > 0:
+            if content[j] == '{':
+                depth += 1
+            elif content[j] == '}':
+                depth -= 1
+            j += 1
+        i = j
+    return "".join(result)
+
+
 def normalize_raw(content):
     """Light normalization for already-raw configs."""
     # Strip BOM
@@ -251,6 +287,11 @@ def normalize_raw(content):
         content = content[1:]
     # Normalize line endings
     content = content.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip Lua blocks (content isn't nginx syntax)
+    if "_by_lua" in content:
+        content = strip_lua_blocks(content)
+    # Strip bare placeholder lines left by template stripping
+    content = re.sub(r"^\s*__[A-Za-z_]+__\s*$", "", content, flags=re.MULTILINE)
     # Strip trailing whitespace per line
     content = re.sub(r"[ \t]+$", "", content, flags=re.MULTILINE)
     # Strip trailing newlines
@@ -277,16 +318,27 @@ def looks_like_nginx(content):
     score = sum(1 for ind in NGINX_INDICATORS if ind in content)
     if score < 2:
         return False
-    # Reject files that look like YAML/Helm values rather than nginx config.
-    # A real nginx config has directive lines like "listen 80;" or block
-    # openers like "server {" as actual statements, not just in comments.
     lines = content.strip().split("\n")
     non_comment_lines = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
     if not non_comment_lines:
         return False
     first_real = non_comment_lines[0]
-    # If the first non-comment line is YAML-like, reject
+    # YAML/Helm values
     if re.match(r"^[\w\-]+:\s", first_real) and "server {" not in first_real:
+        return False
+    # TypeScript/JavaScript imports
+    if re.match(r"^import\s+(type\s+)?\{?", first_real):
+        return False
+    # Perl HTML::Template tags
+    if "<tmpl_" in content.lower():
+        return False
+    # Patch/diff files
+    if first_real.startswith("---") and any(l.startswith("+++") for l in non_comment_lines[:5]):
+        return False
+    if any(l.startswith("@@") for l in non_comment_lines[:10]):
+        return False
+    # HOCON / application.conf (key = value with { blocks, no nginx directives)
+    if re.match(r"^[a-z_]+\s*\{", first_real) and not re.match(r"^(http|events|server|upstream|map|geo|stream|mail)\s*\{", first_real):
         return False
     return True
 
@@ -309,21 +361,28 @@ def process_file(filepath, filename):
 
     if fmt == "raw":
         cleaned = normalize_raw(content)
-        if looks_like_nginx(cleaned):
+        if looks_like_nginx(cleaned) and brace_balanced(cleaned):
             return [(cleaned, "raw")], fmt
         return [], fmt
 
     if fmt == "jinja":
         cleaned = strip_jinja(content)
         cleaned = normalize_raw(cleaned)
-        if looks_like_nginx(cleaned):
+        if looks_like_nginx(cleaned) and brace_balanced(cleaned):
             return [(cleaned, "jinja_stripped")], fmt
+        return [], fmt
+
+    if fmt == "pct_template":
+        cleaned = strip_pct_template(content)
+        cleaned = normalize_raw(cleaned)
+        if looks_like_nginx(cleaned) and brace_balanced(cleaned):
+            return [(cleaned, "pct_stripped")], fmt
         return [], fmt
 
     if fmt == "erb":
         cleaned = strip_erb(content)
         cleaned = normalize_raw(cleaned)
-        if looks_like_nginx(cleaned):
+        if looks_like_nginx(cleaned) and brace_balanced(cleaned):
             return [(cleaned, "erb_stripped")], fmt
         return [], fmt
 

@@ -7,6 +7,7 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include <sys/stat.h>
 #include "conf_parse.h"
 
 
@@ -113,6 +114,25 @@ conf_handler(ngx_conf_t *cf, ngx_int_t last)
             return NGX_ERROR;
         }
         conf_node_append(tree->current, node);
+
+        /* Resolve the include path, then skip if the target is missing.
+         * This avoids noisy "open() failed" errors when scanning configs
+         * outside their original filesystem (e.g. corpus collection). */
+        {
+            ngx_str_t  inc_file;
+            ngx_str_t *args = cf->args->elts;
+
+            inc_file = args[1];
+
+            if (ngx_conf_full_name(cf->cycle, &inc_file, 1) == NGX_OK) {
+                if (strpbrk((char *) inc_file.data, "*?[") == NULL) {
+                    struct stat  sb;
+                    if (stat((char *) inc_file.data, &sb) != 0) {
+                        return NGX_OK;
+                    }
+                }
+            }
+        }
 
         rv = ngx_conf_include(cf, NULL, NULL);
         if (rv != NGX_CONF_OK) {

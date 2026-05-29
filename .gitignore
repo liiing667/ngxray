@@ -6,5 +6,5 @@ results/
 corpus_out/
 github_nginx_corpus/
 .env
-rules/UNRELEASED*.json
+rules/UNRELEASED*
 test-docker
