@@ -45,6 +45,7 @@ class Finding:
     details: str = ""
     conditions: list[str] = field(default_factory=list)
     manual_review: str = ""
+    lab_keywords_matched: list[str] = field(default_factory=list)
 
 
 # ── AST helpers ─────────────────────────────────────────────────────────
@@ -471,11 +472,18 @@ def eval_rule(rule, nodes, filepath):
     return findings
 
 
+def check_lab_keywords(filepath, keywords):
+    lower = os.path.basename(filepath).lower()
+    return [kw for kw in keywords if kw.lower() in lower]
+
+
 def make_finding(rule, primary, matched, filepath):
     detail_parts = []
     for m in matched:
         args_str = " ".join(m.get("args", []))
         detail_parts.append(f"{m['directive']} {args_str}")
+
+    lab_matched = check_lab_keywords(filepath, rule.get("lab_keywords", []))
 
     return Finding(
         rule=rule["id"],
@@ -487,6 +495,7 @@ def make_finding(rule, primary, matched, filepath):
         details="\n".join(detail_parts),
         conditions=list(rule.get("conditions", [])),
         manual_review=rule.get("manual_review", ""),
+        lab_keywords_matched=lab_matched,
     )
 
 
@@ -607,19 +616,39 @@ def main():
 
     if args.jsonl:
         stream = sys.stdin if args.input == "-" else open(args.input)
+        buf = []
         for line in stream:
-            line = line.strip()
-            if not line or not line.startswith("{"):
+            stripped = line.rstrip("\n")
+            if not buf:
+                if not stripped.startswith("{"):
+                    continue
+                # Single-line records (e.g. error records)
+                if stripped.endswith("}"):
+                    try:
+                        rec = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("error"):
+                        failed += 1
+                        continue
+                    scanned += 1
+                    scan_one(rec.get("config", []), rec.get("file", "?"))
+                else:
+                    buf.append(line)
                 continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("error"):
-                failed += 1
-                continue
-            scanned += 1
-            scan_one(rec.get("config", []), rec.get("file", "?"))
+            buf.append(line)
+            if stripped == "}":
+                try:
+                    rec = json.loads("".join(buf))
+                except json.JSONDecodeError:
+                    buf = []
+                    continue
+                buf = []
+                if rec.get("error"):
+                    failed += 1
+                    continue
+                scanned += 1
+                scan_one(rec.get("config", []), rec.get("file", "?"))
 
     elif args.input == "-" and not args.jsonl:
         for line in sys.stdin:
@@ -675,6 +704,9 @@ def main():
                         print(f"      - {cond}")
                 if f.manual_review:
                     print(f"    manual review: {f.manual_review}")
+                if f.lab_keywords_matched:
+                    kws = ", ".join(f.lab_keywords_matched)
+                    print(f"    lab/poc indicator: matched keywords: {kws}")
                 print()
 
         print(f"{len(all_findings)} finding(s) in "
