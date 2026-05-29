@@ -8,3 +8,4 @@ github_nginx_corpus/
 .env
 rules/UNRELEASED*
 test-docker
+.DS_STORE
