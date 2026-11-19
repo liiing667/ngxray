@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass, asdict, field
@@ -30,6 +31,60 @@ PHASE_BOUNDARY_DIRECTIVES = frozenset({
     "location", "limit_except", "map", "geo", "split_clients",
     "types",
 })
+
+# ── Scan outcome model ─────────────────────────────────────────────────
+#
+# Every scan ends in exactly one status, and the status, the printed
+# evidence and the process exit code always agree (fail closed):
+#
+#   clean         — every input parsed and every rule evaluated, no findings
+#   findings      — evaluation completed, vulnerabilities were found
+#   indeterminate — some input/rule could not be evaluated; the "no
+#                   finding" verdict cannot be trusted for those inputs
+#   canceled      — the scan (or a parser subprocess) was cut short;
+#       both        results are partial by definition
+#
+# Only EXIT_CLEAN is zero.  Downstream automation must treat any
+# non-zero exit as "not proven safe".
+
+EXIT_CLEAN = 0
+EXIT_FINDINGS = 1
+EXIT_INDETERMINATE = 2
+EXIT_CANCELED = 3
+
+
+class RuleError(Exception):
+    """A rule file is invalid; verdicts from it cannot be trusted."""
+
+
+class EvaluationError(Exception):
+    """Evaluation could not reach a trustworthy conclusion."""
+
+
+# Rule schema.  Unknown keys are rejected at load time: silently ignoring
+# a misspelled key would change the meaning of a rule (fail open).
+
+RULE_KEYS = frozenset({
+    "id", "cve", "severity", "message", "affected", "fixed", "ref",
+    "explanation", "lab_keywords", "ordered", "chainable", "collect",
+    "match", "conditions", "manual_review", "tests",
+})
+
+PATTERN_KEYS = frozenset({
+    "directive", "directive_any_of", "args", "max_args",
+    "overlapping_refs", "any_arg", "or", "scope",
+})
+
+OR_BRANCH_KEYS = frozenset({"args", "any_arg_from", "any_of"})
+
+CONDITION_KEYS = frozenset({
+    "contains", "regex", "not_regex", "any_of", "extract", "min_unique",
+    "contains_collected", "capture_before_collected",
+})
+
+COLLECT_KEYS = frozenset({"directive", "child_regex", "extract"})
+
+SCOPES = frozenset({"siblings", "subtree", "full_subtree"})
 
 
 # ── Data ────────────────────────────────────────────────────────────────
@@ -116,18 +171,29 @@ def _get_group_ancestors(regex):
 
     Returns a dict mapping each capturing group number to the set of all
     ancestor group numbers that contain it.
+
+    Raises EvaluationError whenever the helper cannot produce a
+    trustworthy answer (missing binary, timeout, rejected pattern, …).
+    Returning an empty map here would silently disable the overlap check
+    and report vulnerable configs as clean (fail open).
     """
     try:
         r = subprocess.run([PCRE_GROUPS, regex],
                            capture_output=True, text=True, timeout=5)
-        if r.returncode != 0:
-            return {}
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        raise EvaluationError(f"pcre_groups helper unavailable: {e}")
+
+    if r.returncode != 0:
+        raise EvaluationError(
+            f"pcre_groups exited with status {r.returncode}")
+
+    try:
         rec = json.loads(r.stdout.strip())
-        if "error" in rec:
-            return {}
-    except (subprocess.TimeoutExpired, json.JSONDecodeError,
-            FileNotFoundError):
-        return {}
+    except json.JSONDecodeError:
+        raise EvaluationError("pcre_groups returned invalid output")
+
+    if "error" in rec:
+        raise EvaluationError(f"pcre_groups rejected regex: {rec['error']}")
 
     parent_map = rec.get("parent", {})
     ancestors = {}
@@ -188,7 +254,9 @@ def rewrites_can_chain(node_a, node_b):
         try:
             return re.search(args_b[0], out_uri) is not None
         except re.error:
-            pass
+            # Python's re cannot parse every PCRE pattern nginx accepts.
+            # An unusable regex check is inconclusive, not negative.
+            return True
 
     out_prefix = rewrite_output_prefix(replacement).lstrip('/')
     rx_prefix = regex_literal_prefix(args_b[0])
@@ -237,14 +305,24 @@ def check_condition(value, cond, collected=None):
       min_unique: int       — (with extract) require >= N distinct matches
       contains_collected: bool — value contains a collected variable
       capture_before_collected: bool — a $N ref appears before a collected var
+
+    Unknown condition keys raise EvaluationError: silently ignoring a
+    (possibly misspelled) key would weaken the condition and let a rule
+    match configs it was never meant to match (fail open).
     """
     if isinstance(cond, str):
         return value == cond
+
+    if not isinstance(cond, dict):
+        raise EvaluationError(f"condition must be a string or object, "
+                              f"got {type(cond).__name__}")
 
     extract_pattern = cond.get("extract")
     min_unique = cond.get("min_unique")
 
     for key, expected in cond.items():
+        if key not in CONDITION_KEYS:
+            raise EvaluationError(f"unknown condition key: {key!r}")
         if key in ("extract", "min_unique"):
             continue
         if key == "contains":
@@ -468,7 +546,7 @@ def make_finding(rule, primary, matched, filepath):
         rule=rule["id"],
         severity=rule["severity"],
         file=filepath,
-        line=primary["line"],
+        line=primary.get("line", 0),
         message=rule["message"],
         cve=rule.get("cve", ""),
         details="\n".join(detail_parts),
@@ -480,28 +558,262 @@ def make_finding(rule, primary, matched, filepath):
 
 # ── Rule loading ───────────────────────────────────────────────────────
 
+def _validate_condition_spec(cond, where):
+    """Reject malformed conditions at load time (fail closed)."""
+    if isinstance(cond, str):
+        return
+    if not isinstance(cond, dict):
+        raise RuleError(f"{where}: condition must be a string or object")
+    for key, val in cond.items():
+        if key not in CONDITION_KEYS:
+            raise RuleError(f"{where}: unknown condition key {key!r}")
+        if key in ("regex", "not_regex", "extract"):
+            if not isinstance(val, str):
+                raise RuleError(f"{where}: {key!r} must be a string")
+            try:
+                re.compile(val)
+            except re.error as e:
+                raise RuleError(f"{where}: invalid {key} pattern: {e}")
+        elif key == "contains":
+            if not isinstance(val, str):
+                raise RuleError(f"{where}: 'contains' must be a string")
+        elif key == "any_of":
+            if (not isinstance(val, list)
+                    or not all(isinstance(v, str) for v in val)):
+                raise RuleError(f"{where}: 'any_of' must be a list of strings")
+        elif key == "min_unique":
+            if not isinstance(val, int):
+                raise RuleError(f"{where}: 'min_unique' must be an integer")
+        elif key in ("contains_collected", "capture_before_collected"):
+            if not isinstance(val, bool):
+                raise RuleError(f"{where}: {key!r} must be a boolean")
+
+
+def _validate_args_spec(args, where):
+    if not isinstance(args, dict):
+        raise RuleError(f"{where}: 'args' must be an object")
+    for idx_str, cond in args.items():
+        try:
+            idx = int(idx_str)
+        except (TypeError, ValueError):
+            raise RuleError(f"{where}: arg index {idx_str!r} is not an integer")
+        if idx < 0:
+            raise RuleError(f"{where}: arg index {idx_str!r} is negative")
+        _validate_condition_spec(cond, f"{where} args[{idx_str!r}]")
+
+
+def _validate_pattern(pat, where):
+    if not isinstance(pat, dict):
+        raise RuleError(f"{where}: match pattern must be an object")
+    unknown = set(pat) - PATTERN_KEYS
+    if unknown:
+        raise RuleError(f"{where}: unknown pattern keys: {sorted(unknown)}")
+    if "directive" not in pat and "directive_any_of" not in pat:
+        raise RuleError(
+            f"{where}: pattern needs 'directive' or 'directive_any_of'")
+    if "directive" in pat and not isinstance(pat["directive"], str):
+        raise RuleError(f"{where}: 'directive' must be a string")
+    if "directive_any_of" in pat:
+        names = pat["directive_any_of"]
+        if (not isinstance(names, list)
+                or not all(isinstance(n, str) for n in names)):
+            raise RuleError(
+                f"{where}: 'directive_any_of' must be a list of strings")
+    scope = pat.get("scope", "siblings")
+    if scope not in SCOPES:
+        raise RuleError(f"{where}: unknown scope {scope!r}")
+    if "args" in pat:
+        _validate_args_spec(pat["args"], where)
+    if "max_args" in pat and not isinstance(pat["max_args"], int):
+        raise RuleError(f"{where}: 'max_args' must be an integer")
+    if "overlapping_refs" in pat and not isinstance(pat["overlapping_refs"], bool):
+        raise RuleError(f"{where}: 'overlapping_refs' must be a boolean")
+    if "any_arg" in pat:
+        _validate_condition_spec(pat["any_arg"], f"{where} 'any_arg'")
+    for branch in pat.get("or", []):
+        if not isinstance(branch, dict):
+            raise RuleError(f"{where}: 'or' branches must be objects")
+        unknown = set(branch) - OR_BRANCH_KEYS
+        if unknown:
+            raise RuleError(
+                f"{where}: unknown 'or' branch keys: {sorted(unknown)}")
+        if "args" in branch:
+            _validate_args_spec(branch["args"], f"{where} 'or' branch")
+        if "any_arg_from" in branch and not isinstance(branch["any_arg_from"], int):
+            raise RuleError(f"{where}: 'any_arg_from' must be an integer")
+        if "any_of" in branch:
+            any_of = branch["any_of"]
+            if (not isinstance(any_of, list)
+                    or not all(isinstance(v, str) for v in any_of)):
+                raise RuleError(
+                    f"{where}: branch 'any_of' must be a list of strings")
+
+
+def validate_rule(rule, source):
+    """Validate a rule's structure; raise RuleError if it cannot be trusted."""
+    where = source
+    if not isinstance(rule, dict):
+        raise RuleError(f"{where}: rule must be a JSON object")
+    unknown = set(rule) - RULE_KEYS
+    if unknown:
+        raise RuleError(f"{where}: unknown rule keys: {sorted(unknown)}")
+    for required in ("id", "severity", "message"):
+        if not isinstance(rule.get(required), str) or not rule.get(required):
+            raise RuleError(
+                f"{where}: missing or invalid required field {required!r}")
+    where = f"{source} (rule {rule['id']})"
+    match = rule.get("match")
+    if not isinstance(match, list) or not match:
+        raise RuleError(f"{where}: 'match' must be a non-empty list")
+    for pat in match:
+        _validate_pattern(pat, where)
+    if rule.get("chainable") and len(match) < 2:
+        raise RuleError(f"{where}: 'chainable' needs at least 2 patterns")
+    if "collect" in rule:
+        collect = rule["collect"]
+        if not isinstance(collect, dict):
+            raise RuleError(f"{where}: 'collect' must be an object")
+        unknown = set(collect) - COLLECT_KEYS
+        if unknown:
+            raise RuleError(f"{where}: unknown collect keys: {sorted(unknown)}")
+        if not isinstance(collect.get("directive"), str):
+            raise RuleError(f"{where}: 'collect' needs a 'directive' string")
+        child_regex = collect.get("child_regex")
+        if child_regex is not None:
+            if not isinstance(child_regex, str):
+                raise RuleError(f"{where}: 'child_regex' must be a string")
+            try:
+                re.compile(child_regex)
+            except re.error as e:
+                raise RuleError(f"{where}: invalid 'child_regex': {e}")
+        if "extract" in collect and not isinstance(collect["extract"], str):
+            raise RuleError(f"{where}: 'extract' must be a string")
+
+
 def load_rules(rules_dir=RULES_DIR):
     rules = []
     for f in sorted(Path(rules_dir).glob("*.json")):
-        with open(f) as fh:
-            rule = json.load(fh)
+        try:
+            with open(f) as fh:
+                rule = json.load(fh)
+        except OSError as e:
+            raise RuleError(f"{f}: cannot read rule: {e}")
+        except json.JSONDecodeError as e:
+            raise RuleError(f"{f}: invalid JSON: {e}")
+        validate_rule(rule, str(f))
         rules.append(rule)
     return rules
 
 
 # ── Config parsing ─────────────────────────────────────────────────────
 
-def parse_file(filepath):
+def parse_file_result(filepath):
+    """Parse one config file with the nginx tokenizer.
+
+    Returns (ast, error).  On success error is None.  Otherwise error is
+    the string "canceled" if the parser had to be killed (timeout), or a
+    human-readable description of the failure.  Callers must treat any
+    error as "cannot determine", never as "clean".
+    """
     try:
         r = subprocess.run([PARSER, filepath],
                            capture_output=True, text=True, errors="replace",
                            timeout=10)
-        if r.returncode != 0:
-            return None
-        return json.loads(r.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError,
-            FileNotFoundError):
-        return None
+    except subprocess.TimeoutExpired:
+        return None, "canceled"
+    except (FileNotFoundError, OSError) as e:
+        return None, f"parser unavailable: {e}"
+    if r.returncode != 0:
+        return None, f"parse failed (parser exited with status {r.returncode})"
+    try:
+        return json.loads(r.stdout), None
+    except json.JSONDecodeError:
+        return None, "parse failed (parser returned invalid JSON)"
+
+
+def parse_file(filepath):
+    ast, _ = parse_file_result(filepath)
+    return ast
+
+
+def validate_ast(nodes, what="config"):
+    """Ensure a parsed AST has the structure the evaluator relies on.
+
+    Pre-parsed JSONL input is attacker-controlled; a malformed node must
+    make the file indeterminate instead of crashing the evaluator or,
+    worse, being silently skipped.
+    """
+    if not isinstance(nodes, list):
+        raise EvaluationError(f"{what}: top-level AST is not a list")
+    for n in nodes:
+        if not isinstance(n, dict) or not isinstance(n.get("directive"), str):
+            raise EvaluationError(
+                f"{what}: malformed AST node (missing 'directive')")
+        args = n.get("args", [])
+        if (not isinstance(args, list)
+                or not all(isinstance(a, str) for a in args)):
+            raise EvaluationError(f"{what}: malformed 'args' in AST node")
+        line = n.get("line", 0)
+        if not isinstance(line, int):
+            raise EvaluationError(f"{what}: malformed 'line' in AST node")
+        blk = n.get("block", [])
+        if blk:
+            validate_ast(blk, what)
+
+
+# ── Scan state ─────────────────────────────────────────────────────────
+
+class ScanState:
+    """Accumulates findings, errors and cancellation across all inputs."""
+
+    def __init__(self):
+        self.findings = []
+        self.scanned = 0
+        self.failed = 0
+        self.errors = []
+        self.canceled = False
+
+    def error(self, msg):
+        self.failed += 1
+        self.errors.append(msg)
+
+    @property
+    def status(self):
+        if self.canceled:
+            return "canceled"
+        if self.failed:
+            return "indeterminate"
+        if self.findings:
+            return "findings"
+        return "clean"
+
+    @property
+    def exit_code(self):
+        return {
+            "clean": EXIT_CLEAN,
+            "findings": EXIT_FINDINGS,
+            "indeterminate": EXIT_INDETERMINATE,
+            "canceled": EXIT_CANCELED,
+        }[self.status]
+
+
+def scan_one(state, rules, ast, filepath):
+    """Evaluate all rules against one parsed config, fail closed."""
+    try:
+        validate_ast(ast, filepath)
+    except EvaluationError as e:
+        state.error(str(e))
+        return
+    state.scanned += 1
+    for rule in rules:
+        try:
+            state.findings.extend(eval_rule(rule, ast, filepath))
+        except EvaluationError as e:
+            state.error(f"{filepath}: rule {rule.get('id', '?')}: {e}")
+        except Exception as e:
+            # A bug in the evaluator must not silently skip a rule.
+            state.error(f"{filepath}: rule {rule.get('id', '?')}: "
+                        f"internal evaluation error: {e}")
 
 
 # ── Self-test ──────────────────────────────────────────────────────────
@@ -536,7 +848,12 @@ def run_tests(rules_dir=RULES_DIR):
                 print(f"    {snippet[:100]}")
                 failed += 1
                 continue
-            findings = eval_rule(rule, ast, "<test>")
+            try:
+                findings = eval_rule(rule, ast, "<test>")
+            except EvaluationError as e:
+                print(f"  FAIL [{rule_id}] evaluation error: {e}")
+                failed += 1
+                continue
             if findings:
                 passed += 1
             else:
@@ -551,7 +868,12 @@ def run_tests(rules_dir=RULES_DIR):
                 print(f"    {snippet[:100]}")
                 failed += 1
                 continue
-            findings = eval_rule(rule, ast, "<test>")
+            try:
+                findings = eval_rule(rule, ast, "<test>")
+            except EvaluationError as e:
+                print(f"  FAIL [{rule_id}] evaluation error: {e}")
+                failed += 1
+                continue
             if not findings:
                 passed += 1
             else:
@@ -564,6 +886,12 @@ def run_tests(rules_dir=RULES_DIR):
 
 
 # ── Main ───────────────────────────────────────────────────────────────
+
+def _raise_canceled(signum, frame):
+    """Convert SIGTERM into KeyboardInterrupt so the scan can report
+    cancellation and exit with EXIT_CANCELED instead of dying silently."""
+    raise KeyboardInterrupt
+
 
 def main():
     ap = argparse.ArgumentParser(description="Scan nginx configs for CVEs")
@@ -580,96 +908,125 @@ def main():
     args = ap.parse_args()
 
     if args.test:
-        passed, failed = run_tests(args.rules)
+        try:
+            passed, failed = run_tests(args.rules)
+        except RuleError as e:
+            print(f"rule error: {e}", file=sys.stderr)
+            sys.exit(1)
         total = passed + failed
         print(f"{passed}/{total} tests passed")
         sys.exit(1 if failed else 0)
 
-    rules = load_rules(args.rules)
-    all_findings = []
-    scanned = failed = 0
+    try:
+        rules = load_rules(args.rules)
+    except RuleError as e:
+        print(f"rule error: {e}", file=sys.stderr)
+        sys.exit(EXIT_INDETERMINATE)
+    if not rules:
+        print(f"no rules found in {args.rules} — cannot scan",
+              file=sys.stderr)
+        sys.exit(EXIT_INDETERMINATE)
 
-    def scan_one(ast, filepath):
-        for rule in rules:
-            all_findings.extend(eval_rule(rule, ast, filepath))
+    state = ScanState()
 
-    if args.jsonl:
-        stream = sys.stdin if args.input == "-" else open(args.input)
-        buf = []
-        for line in stream:
-            stripped = line.rstrip("\n")
-            if not buf:
-                if not stripped.startswith("{"):
-                    continue
-                # Single-line records (e.g. error records)
-                if stripped.endswith("}"):
-                    try:
-                        rec = json.loads(stripped)
-                    except json.JSONDecodeError:
-                        continue
-                    if rec.get("error"):
-                        failed += 1
-                        continue
-                    scanned += 1
-                    scan_one(rec.get("config", []), rec.get("file", "?"))
-                else:
-                    buf.append(line)
-                continue
-            buf.append(line)
-            if stripped == "}":
+    signal.signal(signal.SIGTERM, _raise_canceled)
+
+    def scan_path(path):
+        ast, err = parse_file_result(path)
+        if err == "canceled":
+            state.canceled = True
+            state.error(f"{path}: parser timed out and was killed")
+        elif ast is None:
+            state.error(f"{path}: {err}")
+        else:
+            scan_one(state, rules, ast, path)
+
+    def handle_record(rec):
+        if not isinstance(rec, dict):
+            state.error("jsonl: record is not a JSON object")
+            return
+        if rec.get("error"):
+            state.error(f"{rec.get('file', '?')}: parse failed")
+            return
+        if "config" not in rec:
+            state.error(f"{rec.get('file', '?')}: "
+                        f"jsonl record missing 'config'")
+            return
+        scan_one(state, rules, rec["config"], rec.get("file", "?"))
+
+    try:
+        if args.jsonl:
+            if args.input == "-":
+                stream = sys.stdin
+            else:
                 try:
-                    rec = json.loads("".join(buf))
-                except json.JSONDecodeError:
+                    stream = open(args.input)
+                except OSError as e:
+                    print(f"cannot open {args.input}: {e}", file=sys.stderr)
+                    sys.exit(EXIT_INDETERMINATE)
+            buf = []
+            for line in stream:
+                stripped = line.rstrip("\n")
+                if not buf:
+                    if not stripped.startswith("{"):
+                        continue
+                    # Single-line records (e.g. error records)
+                    if stripped.endswith("}"):
+                        try:
+                            rec = json.loads(stripped)
+                        except json.JSONDecodeError:
+                            state.error("jsonl: undecodable record")
+                            continue
+                        handle_record(rec)
+                    else:
+                        buf.append(line)
+                    continue
+                buf.append(line)
+                if stripped == "}":
+                    try:
+                        rec = json.loads("".join(buf))
+                    except json.JSONDecodeError:
+                        state.error("jsonl: undecodable record")
+                        buf = []
+                        continue
                     buf = []
-                    continue
-                buf = []
-                if rec.get("error"):
-                    failed += 1
-                    continue
-                scanned += 1
-                scan_one(rec.get("config", []), rec.get("file", "?"))
+                    handle_record(rec)
+            if buf:
+                # Producer was cut off mid-record: results are partial.
+                state.canceled = True
+                state.error("jsonl: truncated final record "
+                            "(producer canceled?)")
 
-    elif args.input == "-" and not args.jsonl:
-        for line in sys.stdin:
-            path = line.strip()
-            if not path:
-                continue
-            ast = parse_file(path)
-            if ast is None:
-                failed += 1
-                continue
-            scanned += 1
-            scan_one(ast, path)
-
-    elif os.path.isdir(args.input):
-        for root, _, files in os.walk(args.input):
-            for f in sorted(files):
-                if not f.endswith(".conf"):
+        elif args.input == "-" and not args.jsonl:
+            for line in sys.stdin:
+                path = line.strip()
+                if not path:
                     continue
-                path = os.path.join(root, f)
-                ast = parse_file(path)
-                if ast is None:
-                    failed += 1
-                    continue
-                scanned += 1
-                scan_one(ast, path)
+                scan_path(path)
 
-    else:
-        ast = parse_file(args.input)
-        if ast is None:
-            print(f"parse failed: {args.input}", file=sys.stderr)
-            sys.exit(1)
-        scanned = 1
-        scan_one(ast, args.input)
+        elif os.path.isdir(args.input):
+            for root, _, files in os.walk(args.input):
+                for f in sorted(files):
+                    if not f.endswith(".conf"):
+                        continue
+                    scan_path(os.path.join(root, f))
+
+        else:
+            scan_path(args.input)
+
+    except KeyboardInterrupt:
+        state.canceled = True
+        print("scan canceled — results are partial", file=sys.stderr)
+    except Exception as e:
+        # Any unexpected failure still fails closed.
+        state.error(f"internal error: {e}")
 
     if args.json:
-        json.dump([asdict(f) for f in all_findings], sys.stdout, indent=2)
+        json.dump([asdict(f) for f in state.findings], sys.stdout, indent=2)
         print()
     else:
-        if not all_findings:
-            print("No vulnerabilities found.", file=sys.stderr)
-        else:
-            for f in all_findings:
+        if state.findings:
+            for f in state.findings:
                 cve = f" ({f.cve})" if f.cve else ""
                 print(f"[{f.severity}] {f.rule}{cve}")
                 print(f"  {f.file}:{f.line}")
@@ -687,10 +1044,16 @@ def main():
                     kws = ", ".join(f.lab_keywords_matched)
                     print(f"    lab/poc indicator: matched keywords: {kws}")
                 print()
+        elif not state.failed and not state.canceled:
+            print("No vulnerabilities found.", file=sys.stderr)
 
-        print(f"{len(all_findings)} finding(s) in "
-              f"{scanned} config(s) ({failed} failed)",
-              file=sys.stderr)
+    for e in state.errors:
+        print(f"error: {e}", file=sys.stderr)
+    print(f"status: {state.status}", file=sys.stderr)
+    print(f"{len(state.findings)} finding(s) in "
+          f"{state.scanned} config(s) ({state.failed} failed)",
+          file=sys.stderr)
+    sys.exit(state.exit_code)
 
 
 if __name__ == "__main__":

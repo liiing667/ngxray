@@ -66,6 +66,23 @@ python3 scan.py --json /etc/nginx/nginx.conf
 python3 scan.py --rules ./my-rules/ /etc/nginx/nginx.conf
 ```
 
+## Exit codes and scan status
+
+The scanner fails closed: only a fully determined, finding-free scan exits 0.
+Every run ends with a `status:` line on stderr that always agrees with the
+exit code and the printed findings:
+
+| Status | Exit | Meaning |
+|--------|------|---------|
+| `clean` | 0 | all inputs parsed, all rules evaluated, no findings |
+| `findings` | 1 | evaluation completed, vulnerabilities were found |
+| `indeterminate` | 2 | some input/rule could not be evaluated (parse failure, invalid rule, unavailable helper); the absence of findings cannot be trusted |
+| `canceled` | 3 | the scan or a parser subprocess was cut short (SIGINT/SIGTERM, parser timeout, truncated JSONL stream); results are partial |
+
+Any non-zero exit means "not proven safe". In particular, a config that
+fails to parse, a rule that fails to evaluate, or a killed parser is never
+reported as clean.
+
 ## Corpus Collection
 
 The `corpus_tools/` package can collect public nginx configuration material
