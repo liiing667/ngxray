@@ -247,6 +247,8 @@ conf_parse_file(conf_tree_t *tree, ngx_log_t *log, const char *filename)
     file.data = (u_char *)filename;
     file.len = ngx_strlen(filename);
 
+    tree->file = file;
+
     rv = ngx_conf_parse(&cf, &file);
 
     return (rv == NGX_CONF_OK) ? NGX_OK : NGX_ERROR;
@@ -281,7 +283,7 @@ json_escape(FILE *out, u_char *data, size_t len)
 
 
 static void
-node_to_json(conf_node_t *node, FILE *out, int indent)
+node_to_json(conf_node_t *node, FILE *out, int indent, const ngx_str_t *ctx_file)
 {
     conf_node_t  *child;
     ngx_str_t    *arg;
@@ -292,6 +294,22 @@ node_to_json(conf_node_t *node, FILE *out, int indent)
 
     fputs("{\"directive\":", out);
     json_escape(out, node->directive.data, node->directive.len);
+
+    /* Stamp the source file on nodes that cross an include boundary, so
+     * downstream consumers can attribute every directive to the file it
+     * was actually read from.  Nodes in the same file as their context
+     * inherit it implicitly and keep the output compact. */
+    if (node->file.len > 0
+        && (ctx_file == NULL
+            || ctx_file->len != node->file.len
+            || ngx_strncmp(ctx_file->data, node->file.data, node->file.len)
+               != 0))
+    {
+        fputs(",\"file\":", out);
+        json_escape(out, node->file.data, node->file.len);
+        ctx_file = &node->file;
+    }
+
     fprintf(out, ",\"line\":%lu,\"args\":[", (unsigned long)node->line);
 
     if (node->args.nelts > 0) {
@@ -306,7 +324,7 @@ node_to_json(conf_node_t *node, FILE *out, int indent)
     if (node->children) {
         fputs(",\"block\":[\n", out);
         for (child = node->children; child; child = child->next) {
-            node_to_json(child, out, indent + 1);
+            node_to_json(child, out, indent + 1, ctx_file);
             fputs(child->next ? ",\n" : "\n", out);
         }
         for (ind = 0; ind < indent; ind++) fputs("  ", out);
@@ -321,10 +339,13 @@ void
 conf_tree_to_json(conf_tree_t *tree, FILE *out)
 {
     conf_node_t  *node;
+    ngx_str_t    *ctx_file;
+
+    ctx_file = tree->file.len > 0 ? &tree->file : NULL;
 
     fputs("[\n", out);
     for (node = tree->root->children; node; node = node->next) {
-        node_to_json(node, out, 1);
+        node_to_json(node, out, 1, ctx_file);
         fputs(node->next ? ",\n" : "\n", out);
     }
     fputs("]\n", out);

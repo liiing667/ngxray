@@ -46,12 +46,62 @@ class Finding:
     conditions: list[str] = field(default_factory=list)
     manual_review: str = ""
     lab_keywords_matched: list[str] = field(default_factory=list)
+    object: str = ""
+    chain: list[str] = field(default_factory=list)
 
 
 # ── AST helpers ─────────────────────────────────────────────────────────
 
 def children(node):
     return node.get("block", [])
+
+
+def describe_node(node):
+    """One-line identity of a config object: directive plus its args."""
+    args = " ".join(node.get("args", []))
+    return f"{node['directive']} {args}".strip()
+
+
+def build_context(nodes, filepath):
+    """Index parent and source-file identity for every node in the tree.
+
+    The parser stamps a "file" key on nodes that cross an include
+    boundary; every other node inherits the file of its enclosing
+    context.  Returns (parent_map, file_map) keyed by id(node).
+    """
+    parent = {}
+    node_file = {}
+
+    def index(ns, par, cur_file):
+        for n in ns:
+            parent[id(n)] = par
+            node_file[id(n)] = n.get("file") or cur_file
+            index(children(n), n, node_file[id(n)])
+
+    index(nodes, None, filepath)
+    return parent, node_file
+
+
+def inheritance_chain(node, parent, node_file, filepath):
+    """Verifiable identity chain for a finding: root file, every include
+    boundary crossed, and every enclosing config object down to the
+    matched directive."""
+    ancestors = []
+    cur = parent.get(id(node))
+    while cur is not None:
+        ancestors.append(cur)
+        cur = parent.get(id(cur))
+    ancestors.reverse()
+
+    chain = [f"file: {filepath}"]
+    cur_file = filepath
+    for anc in ancestors:
+        f = node_file[id(anc)]
+        if f != cur_file:
+            chain.append(f"file: {f}")
+            cur_file = f
+        chain.append(f"block: {describe_node(anc)}")
+    return chain
 
 
 def _match_name(directive, name):
@@ -405,6 +455,7 @@ def eval_rule(rule, nodes, filepath):
     findings = []
     patterns = rule["match"]
     collected = None
+    parent_map, file_map = build_context(nodes, filepath)
 
     if "collect" in rule:
         collected = collect_phase(nodes, rule["collect"])
@@ -416,37 +467,53 @@ def eval_rule(rule, nodes, filepath):
         dname = pat.get("directive_any_of", pat.get("directive"))
         for node in walk(nodes, dname):
             if match_directive(node, pat, collected):
-                findings.append(make_finding(rule, node, [node], filepath))
+                findings.append(make_finding(rule, node, [node], filepath,
+                                             parent_map, file_map))
 
     else:
         ordered = rule.get("ordered", False)
-        for block, parent in all_blocks(nodes):
-            matched = []
-            last_pos = -1
-            for pat in patterns:
-                hit = None
-                candidates = _get_candidates(block, pat)
-                for node_pos, node in candidates:
-                    if match_directive(node, pat, collected):
+        seen = set()
+        for block, block_parent in all_blocks(nodes):
+            # One finding per distinct primary match: greedily complete
+            # each candidate of the first pattern so that multiple hits
+            # in the same block are reported individually instead of
+            # being silently deduplicated into the first one.
+            first = patterns[0]
+            primaries = [(pos, n)
+                         for pos, n in _get_candidates(block, first)
+                         if match_directive(n, first, collected)]
+            for first_pos, first_node in primaries:
+                matched = [first_node]
+                last_pos = first_pos
+                for pat in patterns[1:]:
+                    hit = None
+                    for node_pos, node in _get_candidates(block, pat):
+                        if not match_directive(node, pat, collected):
+                            continue
                         if ordered:
                             if node_pos <= last_pos:
                                 continue
                             last_pos = node_pos
                         hit = node
                         break
-                if hit is None:
-                    break
-                matched.append(hit)
+                    if hit is None:
+                        break
+                    matched.append(hit)
 
-            if len(matched) != len(patterns):
-                continue
-
-            if rule.get("chainable"):
-                if not rewrites_can_chain(matched[0], matched[1]):
+                if len(matched) != len(patterns):
                     continue
 
-            findings.append(make_finding(rule, matched[0], matched,
-                                         filepath))
+                if rule.get("chainable"):
+                    if not rewrites_can_chain(matched[0], matched[1]):
+                        continue
+
+                key = tuple(id(m) for m in matched)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                findings.append(make_finding(rule, matched[0], matched,
+                                             filepath, parent_map, file_map))
 
     return findings
 
@@ -456,7 +523,7 @@ def check_lab_keywords(filepath, keywords):
     return [kw for kw in keywords if kw.lower() in lower]
 
 
-def make_finding(rule, primary, matched, filepath):
+def make_finding(rule, primary, matched, filepath, parent_map, file_map):
     detail_parts = []
     for m in matched:
         args_str = " ".join(m.get("args", []))
@@ -464,10 +531,22 @@ def make_finding(rule, primary, matched, filepath):
 
     lab_matched = check_lab_keywords(filepath, rule.get("lab_keywords", []))
 
+    # Attribute the finding to the file the directive was actually read
+    # from (include boundaries are stamped by the parser), and record the
+    # enclosing config object plus the full inheritance chain so the
+    # finding keeps a verifiable identity across every report output.
+    real_file = file_map.get(id(primary), filepath)
+    chain = inheritance_chain(primary, parent_map, file_map, filepath)
+    obj = ""
+    for step in reversed(chain):
+        if step.startswith("block: "):
+            obj = step[len("block: "):]
+            break
+
     return Finding(
         rule=rule["id"],
         severity=rule["severity"],
-        file=filepath,
+        file=real_file,
         line=primary["line"],
         message=rule["message"],
         cve=rule.get("cve", ""),
@@ -475,6 +554,8 @@ def make_finding(rule, primary, matched, filepath):
         conditions=list(rule.get("conditions", [])),
         manual_review=rule.get("manual_review", ""),
         lab_keywords_matched=lab_matched,
+        object=obj,
+        chain=chain,
     )
 
 
@@ -673,6 +754,12 @@ def main():
                 cve = f" ({f.cve})" if f.cve else ""
                 print(f"[{f.severity}] {f.rule}{cve}")
                 print(f"  {f.file}:{f.line}")
+                if f.object:
+                    print(f"  object: {f.object}")
+                if f.chain:
+                    print("  chain:")
+                    for step in f.chain:
+                        print(f"    - {step}")
                 print(f"  {f.message}")
                 if f.details:
                     for dl in f.details.split("\n"):

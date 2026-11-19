@@ -20,6 +20,7 @@ typedef struct {
     conf_node_t    *root;
     conf_node_t    *current;
     ngx_uint_t      depth;
+    ngx_str_t       file;
 } conf_tree_t;
 
 conf_tree_t *conf_tree_create(ngx_pool_t *pool);

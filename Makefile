@@ -1,7 +1,7 @@
 NGX_SRC  = nginx/src
 CC      ?= cc
 CFLAGS  ?= -O2
-CFLAGS  += -Wall -Wno-unused-function -Wno-deprecated-declarations
+CFLAGS  += -Wall -Wno-unused-function -Wno-deprecated-declarations -fcommon
 
 ifneq ($(MAKECMDGOALS),clean)
 ifeq ($(wildcard $(NGX_SRC)/core/ngx_palloc.c),)
@@ -42,6 +42,11 @@ PCRE_GROUPS = $(BUILDDIR)/pcre_groups
 
 PCRE2_CFLAGS := $(shell pkg-config --cflags libpcre2-8 2>/dev/null)
 PCRE2_LIBS   := $(shell pkg-config --libs libpcre2-8 2>/dev/null)
+ifeq ($(PCRE2_LIBS),)
+# Fall back to the vendored header and the system runtime library.
+PCRE2_CFLAGS := -Iparser
+PCRE2_LIBS   := -l:libpcre2-8.so.0
+endif
 
 all: $(TARGET) $(PCRE_GROUPS)
 

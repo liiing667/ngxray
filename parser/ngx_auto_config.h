@@ -96,7 +96,7 @@
 #endif
 
 #ifndef NGX_HAVE_D_NAMLEN
-#define NGX_HAVE_D_NAMLEN  1
+#define NGX_HAVE_D_NAMLEN  0
 #endif
 
 #ifndef NGX_HAVE_D_TYPE

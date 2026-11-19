@@ -113,6 +113,24 @@ Drop a JSON file in `rules/`. The engine loads all `*.json` files from the rules
 
 Each rule can include `tests` with `vulnerable` (must trigger) and `safe` (must not trigger) config snippets. Run `python3 scan.py --test` to validate all rules.
 
+## Finding identity
+
+Every finding carries a verifiable identity in all report outputs (text,
+`--json`, and JSONL-driven scans):
+
+- **`rule` / `severity`** — the rule ID and severity from the rule file.
+- **`file` / `line`** — the file the directive was actually read from.
+  The parser stamps each AST node that crosses an `include` boundary with
+  its real source file, so findings in included files are attributed to
+  the included file, not the top-level config.
+- **`object`** — the enclosing config object (e.g. `location ~ ^/api/(.*)$`).
+- **`chain`** — the full inheritance chain: root file, every `include`
+  boundary crossed, and every enclosing block down to the match.
+
+When several rules (or several independent matches of one rule) hit the
+same block, each hit is reported as its own finding with its own
+identity — matches are never merged or dropped.
+
 ### Match patterns
 
 `match` is a list of directive conditions. If there's one condition, the engine searches the entire config tree for any matching directive. If there are multiple, all conditions must match sibling directives in the same block.
