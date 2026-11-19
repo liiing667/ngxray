@@ -31,6 +31,40 @@ PHASE_BOUNDARY_DIRECTIVES = frozenset({
     "types",
 })
 
+# Directives of the rewrite module.  A server/location block that contains
+# any of these compiles its own rewrite-phase script and therefore does NOT
+# inherit rewrite-phase directives from the enclosing level (nginx merges
+# rewrite configs only when the current level defined none).
+REWRITE_PHASE_DIRECTIVES = frozenset({
+    "rewrite", "set", "if", "break", "return",
+    "rewrite_log", "uninitialized_variable_warn",
+})
+
+# Blocks that form inheritance contexts for rewrite-phase directives.
+INHERITANCE_CONTEXT_DIRECTIVES = frozenset({
+    "http", "server", "location", "limit_except",
+})
+
+# Severity ordering used for rule priority, finding sort order and exit
+# codes.  Higher rank wins every conflict; evaluation/output order never
+# decides conflicts (last-one-wins is explicitly avoided).
+SEVERITY_RANK = {
+    "INFO": 0,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+    "CRITICAL": 4,
+}
+
+# Exit codes: 0 = no findings, 1-4 = highest remaining severity rank
+# (LOW..CRITICAL), 5 = tool error (parse failure, unreadable rules, ...).
+EXIT_TOOL_ERROR = 5
+
+
+def severity_rank(severity):
+    """Map a severity string to its rank.  Unknown severities rank as INFO."""
+    return SEVERITY_RANK.get(str(severity).upper(), 0)
+
 
 # ── Data ────────────────────────────────────────────────────────────────
 
@@ -97,13 +131,32 @@ def walk_all(nodes):
         yield from walk_all(children(n))
 
 
-def all_blocks(nodes):
-    """Yield (block_contents, parent_node) for every block in the tree."""
+def all_blocks(nodes, inherited=()):
+    """Yield (block_contents, parent_node) for every block in the tree.
+
+    Applies nginx rewrite-phase inheritance: a server/location/limit_except
+    block with no rewrite-phase directives of its own inherits the nearest
+    enclosing level's rewrite-phase directives, so rules are evaluated
+    against the directives that actually execute for a request.  Blocks
+    with their own rewrite-phase directives are evaluated as-is (nginx
+    ignores inherited ones in that case).
+    """
     for n in nodes:
         blk = children(n)
-        if blk:
+        if not blk:
+            continue
+        if n["directive"] in INHERITANCE_CONTEXT_DIRECTIVES:
+            own = [c for c in blk
+                   if c["directive"] in REWRITE_PHASE_DIRECTIVES]
+            if own:
+                yield blk, n
+                yield from all_blocks(blk, own)
+            else:
+                yield list(inherited) + blk, n
+                yield from all_blocks(blk, inherited)
+        else:
             yield blk, n
-            yield from all_blocks(blk)
+            yield from all_blocks(blk, inherited)
 
 
 # ── Regex structure analysis ───────────────────────────────────────────
@@ -486,7 +539,77 @@ def load_rules(rules_dir=RULES_DIR):
         with open(f) as fh:
             rule = json.load(fh)
         rules.append(rule)
+    # Deterministic priority: highest severity first, ties broken by rule
+    # id.  Evaluation order never decides conflicts, but keeping it stable
+    # makes output independent of file names and directory order.
+    rules.sort(key=lambda r: (-severity_rank(r.get("severity", "")),
+                              r.get("id", "")))
     return rules
+
+
+# ── Finding post-processing ────────────────────────────────────────────
+
+def dedup_findings(findings):
+    """Drop exact duplicate findings (same rule, file, line, evidence).
+
+    Inheritance can surface the same matched directives through several
+    effective blocks (server level and each inheriting location).  Only
+    exact duplicates are removed — findings from different rules or with
+    different evidence are always kept, so a low-severity result can never
+    displace a high-severity one.
+    """
+    seen = set()
+    out = []
+    for f in findings:
+        key = (f.rule, f.file, f.line, f.details)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f)
+    return out
+
+
+def sort_findings(findings):
+    """Deterministic order: by location, then highest severity first."""
+    return sorted(findings,
+                  key=lambda f: (f.file, f.line, -severity_rank(f.severity),
+                                 f.rule))
+
+
+def findings_exit_code(findings):
+    """Exit code reflects the HIGHEST-severity remaining finding.
+
+    Computed as a maximum over all findings, never from the last one, so a
+    later low-severity rule cannot downgrade the result of a high-severity
+    one.
+    """
+    if not findings:
+        return 0
+    return max(1, max(severity_rank(f.severity) for f in findings))
+
+
+# ── Ignore lists ───────────────────────────────────────────────────────
+
+def load_ignore_set(ignore_args, ignore_files):
+    """Build the set of ignored rule IDs.
+
+    Matching is exact rule-ID only (no globs), so ignoring one rule can
+    never suppress findings from a different — possibly higher-severity —
+    rule.
+    """
+    ignore = set()
+    for value in ignore_args or []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                ignore.add(part)
+    for path in ignore_files or []:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    ignore.add(line)
+    return ignore
 
 
 # ── Config parsing ─────────────────────────────────────────────────────
@@ -577,6 +700,13 @@ def main():
                     help="rules directory (default: rules/)")
     ap.add_argument("--test", action="store_true",
                     help="run embedded tests from rule files and exit")
+    ap.add_argument("--ignore", action="append", default=[], metavar="RULE_ID",
+                    help="rule ID to suppress (exact match; repeatable, "
+                         "comma-separated accepted)")
+    ap.add_argument("--ignore-file", action="append", default=[],
+                    metavar="PATH",
+                    help="file with one rule ID per line to suppress "
+                         "(# comments allowed); repeatable")
     args = ap.parse_args()
 
     if args.test:
@@ -585,12 +715,25 @@ def main():
         print(f"{passed}/{total} tests passed")
         sys.exit(1 if failed else 0)
 
-    rules = load_rules(args.rules)
+    try:
+        rules = load_rules(args.rules)
+        ignore = load_ignore_set(args.ignore, args.ignore_file)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(EXIT_TOOL_ERROR)
+
+    known_ids = {r.get("id", "") for r in rules}
+    for rule_id in sorted(ignore - known_ids):
+        print(f"warning: ignored rule ID not found: {rule_id}",
+              file=sys.stderr)
+
     all_findings = []
     scanned = failed = 0
 
     def scan_one(ast, filepath):
         for rule in rules:
+            if rule.get("id") in ignore:
+                continue
             all_findings.extend(eval_rule(rule, ast, filepath))
 
     if args.jsonl:
@@ -658,9 +801,16 @@ def main():
         ast = parse_file(args.input)
         if ast is None:
             print(f"parse failed: {args.input}", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_TOOL_ERROR)
         scanned = 1
         scan_one(ast, args.input)
+
+    if scanned == 0 and failed > 0:
+        print(f"error: no config could be parsed ({failed} failed)",
+              file=sys.stderr)
+        sys.exit(EXIT_TOOL_ERROR)
+
+    all_findings = sort_findings(dedup_findings(all_findings))
 
     if args.json:
         json.dump([asdict(f) for f in all_findings], sys.stdout, indent=2)
@@ -691,6 +841,8 @@ def main():
         print(f"{len(all_findings)} finding(s) in "
               f"{scanned} config(s) ({failed} failed)",
               file=sys.stderr)
+
+    sys.exit(findings_exit_code(all_findings))
 
 
 if __name__ == "__main__":

@@ -66,6 +66,39 @@ python3 scan.py --json /etc/nginx/nginx.conf
 python3 scan.py --rules ./my-rules/ /etc/nginx/nginx.conf
 ```
 
+## Suppressing rules
+
+Findings can be suppressed per rule ID — exact matches only, never globs, so
+suppressing one rule can never hide findings from a different rule:
+
+```bash
+# Suppress one or more rules by ID (repeatable, comma-separated accepted)
+python3 scan.py --ignore rewrite-is-args-chain /etc/nginx/
+
+# Suppress via a file: one rule ID per line, '#' comments allowed
+python3 scan.py --ignore-file ./ngxray.ignore /etc/nginx/
+```
+
+Unknown rule IDs in an ignore list produce a warning on stderr.
+
+## Exit codes
+
+The exit code reflects the **highest** severity among all remaining
+findings — computed as a maximum, never from the last rule evaluated, so a
+later low-severity rule can never downgrade a high-severity result:
+
+| Code | Meaning |
+|------|---------|
+| 0 | no findings (after ignores) |
+| 1 | highest finding severity is INFO/LOW |
+| 2 | highest finding severity is MEDIUM |
+| 3 | highest finding severity is HIGH |
+| 4 | highest finding severity is CRITICAL |
+| 5 | tool error (unparseable config, unreadable rules/ignore file) |
+
+`--test` keeps its own convention: 0 when all embedded rule tests pass, 1
+otherwise.
+
 ## Corpus Collection
 
 The `corpus_tools/` package can collect public nginx configuration material
@@ -203,6 +236,21 @@ The remaining nginx source files (pool allocator, string functions, logging, etc
 ### Scanner
 
 `scan.py` loads JSON rules from `rules/`, parses configs via `nginx_conf_parse`, and evaluates each rule against the AST. All detection specifics live in the JSON rule files.
+
+### Evaluation semantics
+
+- **Inheritance** — like nginx itself, a `server`/`location`/`limit_except`
+  block with no rewrite-phase directives (`rewrite`, `set`, `if`, `break`,
+  `return`) of its own inherits the nearest enclosing level's rewrite-phase
+  directives; multi-directive rules are evaluated against these effective
+  blocks. Blocks defining their own rewrite-phase directives are evaluated
+  as-is. Identical findings surfaced through several inheriting blocks are
+  reported once.
+- **Rule priority** — rules are evaluated in deterministic order: highest
+  severity first, ties broken by rule ID. Findings are reported sorted by
+  location, then highest severity first. Conflicts are never resolved by
+  evaluation or file order (no last-one-wins): every finding is kept, and
+  any aggregate result (counts, exit code) is the maximum severity.
 
 ## Building
 
